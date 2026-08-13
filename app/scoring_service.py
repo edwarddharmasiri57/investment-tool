@@ -5,6 +5,18 @@ why a company scored the way it did and tune the weights yourself.
 """
 
 DEFAULT_WEIGHTS = {"value": 0.3, "quality": 0.3, "momentum": 0.2, "growth": 0.2}
+TRADE_SCORE_WEIGHTS = {"financials": 0.5, "news": 0.3, "social": 0.2}
+
+# Extended weights used only when score_company() is called with dcf/risk data
+# (see docstring on score_company). Rebalanced from DEFAULT_WEIGHTS so the four
+# original factors still dominate but intrinsic value gets real weight, per the
+# "DCF margin of safety is a more serious signal than the composite" argument.
+EXTENDED_WEIGHTS = {
+    "value": 0.20, "quality": 0.20, "momentum": 0.10, "growth": 0.15,
+    "intrinsic_value": 0.25, "financial_strength": 0.10,
+}
+DISTRESS_PENALTY = 0.5   # Altman Z-Score "distress" zone: composite cut in half
+GREY_ZONE_PENALTY = 0.85  # Altman Z-Score "grey" zone: composite cut 15%
 
 
 def _clamp(x, lo=0, hi=100):
@@ -32,7 +44,14 @@ def _score_higher_is_better(value, bad, good):
     return _clamp(100 * (value - bad) / (good - bad))
 
 
-def score_company(data: dict) -> dict:
+def score_company(data: dict, dcf: dict | None = None, risk: dict | None = None) -> dict:
+    """dcf/risk are optional - pass the dicts returned by dcf_service.get_dcf()
+    and risk_service.get_risk_profile() to fold DCF margin of safety and the
+    Piotroski F-Score into the composite, and apply an Altman Z-Score distress
+    penalty on top. Callers that don't pass them (e.g. /api/company, /api/screen)
+    get the exact same plain 4-factor composite as before - this is opt-in so
+    the light endpoints don't pay for DCF/statement fetches they don't need.
+    """
     # --- Value: cheaper relative to earnings/book = higher score ---
     pe_score = _score_lower_is_better(data.get("pe_ratio"), good=10, bad=40)
     peg_score = _score_lower_is_better(data.get("peg_ratio"), good=1, bad=3)
@@ -75,15 +94,67 @@ def score_company(data: dict) -> dict:
         "growth": growth_score,
     }
 
+    extended = dcf is not None or risk is not None
+    if extended:
+        # --- Intrinsic value: DCF margin of safety, -50% or worse -> 0, +50% or better -> 100 ---
+        margin_of_safety = dcf.get("margin_of_safety_pct") if dcf else None
+        sub_scores["intrinsic_value"] = _score_higher_is_better(margin_of_safety, bad=-50, good=50)
+
+        # --- Financial strength: Piotroski F-Score (0-9) scaled to 0-100 ---
+        f_score = (risk or {}).get("piotroski_f_score", {}).get("f_score")
+        sub_scores["financial_strength"] = _clamp(f_score / 9 * 100) if f_score is not None else None
+
+    weights = EXTENDED_WEIGHTS if extended else DEFAULT_WEIGHTS
     available = {k: v for k, v in sub_scores.items() if v is not None}
     if available:
-        weight_sum = sum(DEFAULT_WEIGHTS[k] for k in available)
-        composite = round(sum(v * DEFAULT_WEIGHTS[k] for k, v in available.items()) / weight_sum, 1)
+        weight_sum = sum(weights[k] for k in available)
+        composite = round(sum(v * weights[k] for k, v in available.items()) / weight_sum, 1)
+    else:
+        composite = None
+
+    # Altman Z-Score distress override: applied regardless of how good the
+    # other factors look, since a bankruptcy-risk flag isn't just "one more
+    # factor to average in" - it's a reason to distrust the rest of the score.
+    distress_penalty = None
+    risk_flag = None
+    zone = (risk or {}).get("altman_z_score", {}).get("zone") if risk else None
+    if zone == "distress":
+        distress_penalty = DISTRESS_PENALTY
+        risk_flag = "Altman Z-Score indicates bankruptcy distress risk - composite cut 50% regardless of other factors."
+    elif zone == "grey":
+        distress_penalty = GREY_ZONE_PENALTY
+        risk_flag = "Altman Z-Score is in the grey zone - composite cut 15% as a caution."
+
+    if composite is not None and distress_penalty is not None:
+        composite = round(composite * distress_penalty, 1)
+
+    total_factors = len(weights)
+    return {
+        "composite_score": composite,
+        "sub_scores": sub_scores,
+        "data_completeness": f"{len(available)}/{total_factors} factors available",
+        "distress_penalty_applied": distress_penalty,
+        "risk_flag": risk_flag,
+    }
+
+
+def combine_scores(financials_score, news_score, social_score) -> dict:
+    """Weighted combine of the financials/news/social pillar composites.
+    Missing pillars are dropped and the remaining weights renormalized,
+    same approach as score_company()'s sub-score combine.
+    """
+    pillar_scores = {"financials": financials_score, "news": news_score, "social": social_score}
+    available = {k: v for k, v in pillar_scores.items() if v is not None}
+
+    if available:
+        weight_sum = sum(TRADE_SCORE_WEIGHTS[k] for k in available)
+        composite = round(sum(v * TRADE_SCORE_WEIGHTS[k] for k, v in available.items()) / weight_sum, 1)
     else:
         composite = None
 
     return {
-        "composite_score": composite,
-        "sub_scores": sub_scores,
-        "data_completeness": f"{len(available)}/4 factors available",
+        "trade_score": composite,
+        "pillar_scores": pillar_scores,
+        "weights": TRADE_SCORE_WEIGHTS,
+        "data_completeness": f"{len(available)}/3 pillars available",
     }
